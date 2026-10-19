@@ -1,0 +1,1119 @@
+---
+title: "Final Project Jamie Ghossein"
+author: "JG"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+---
+# Final Project
+
+## Data preparation
+
+I will begin by loading the required packages including `tidyverse` for data preparation and plotting, and `ComplexHeatmap` for the heatmap. Next, I will import the RNA-seq count data and the associated sample metadata.
+
+In the count data, each row represents a gene and each column represents a sample. I will use the gene IDs in the first column as row names and preserve the original sample IDs. In the metadata, each row describes a sample, including characteristics such as sample type and tumor stage.
+
+After importing the files, I will check their dimensions and preview a small section of each dataset. Finally, I will verify that the sample IDs in the count data match the metadata barcodes in the same order. This ensures that gene counts are correctly associated with each sample’s characteristics.
+
+
+```{r}
+
+# Read data from the data folder beside this R Markdown file.
+
+# Load the packages needed for data preparation and plotting.
+library(tidyverse)
+library(ComplexHeatmap)
+
+# Read the gene count data.
+# The first column contains gene IDs, so use it as the row names.
+# check.names = FALSE preserves the original sample IDs.
+counts <- read.csv(
+  "data/counts.csv",
+  row.names = 1,
+  check.names = FALSE
+)
+
+# Read the metadata describing each sample.
+metadata <- read.csv(
+  "data/meta_data.csv",
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+# Check the number of rows and columns in each dataset.
+dim(counts)
+dim(metadata)
+
+# Preview a small section of each dataset.
+# This avoids printing all the sample columns.
+counts[1:5, 1:4]
+metadata[1:5, 1:6]
+
+# Check that the count columns match the metadata samples
+# and that they appear in the same order.
+identical(colnames(counts), metadata$barcode)
+
+```
+
+## Exploratory gene selection
+
+Instead of picking a gene at random, I would like to do a preliminary visualization to pick a gene with large observed differences between the normal and tumor tissue. To do this, I will need to explore differences in gene expression between primary tumor and normal tissue samples. I will use this exploration to identify candidate genes, then consider their biological relevance when making my selection.
+
+First, I will select the two sample types from the metadata and extract their corresponding count columns using the sample barcodes. This keeps the gene counts and metadata in the same order. I will also check how many samples are available in each group.
+
+```{r}
+
+# Keep primary tumor and normal tissue samples for exploration.
+explore_metadata <- metadata %>%
+  filter(sample_type %in% c(
+    "Primary Tumor",
+    "Solid Tissue Normal"
+  ))
+
+# Extract the matching count columns in the same order as metadata.
+explore_counts <- as.matrix(
+  counts[, explore_metadata$barcode]
+)
+
+# Check how many samples are available in each group.
+table(explore_metadata$sample_type)
+
+#Before comparing gene expression between tumor and normal samples
+#I will calculate counts per million (CPM).
+#This adjusts each gene’s count relative to the total counts in its sample
+#helping account for differences in sequencing depth.
+
+# Calculate the total gene counts in each sample.
+library_sizes <- colSums(explore_counts)
+
+# Divide each column by that sample's total counts,
+# then multiply by one million to obtain CPM.
+explore_cpm <- sweep(
+  explore_counts,
+  MARGIN = 2,
+  STATS = library_sizes,
+  FUN = "/"
+) * 1000000
+
+# Preview CPM values for five genes and four samples.
+explore_cpm[1:5, 1:4]
+
+#Filter and transform expression values
+#For this exploration, I will retain genes with at least 1 CPM
+#in at least 10 samples. This removes genes with very little 
+#expression while retaining genes that may be expressed 
+#mainly in one tissue group.
+#I will then calculate log2(CPM + 1). 
+#This compresses large values so expression patterns are easier to visualize. 
+#Adding 1 allows samples with zero counts to remain in the analysis.
+
+#Identify genes with at least 1 CPM in at least 10 samples.
+keep_genes <- rowSums(explore_cpm >= 1) >= 10
+
+# Check how many genes meet this filtering rule.
+sum(keep_genes)
+
+# Keep the qualifying gene rows and all sample columns.
+filtered_cpm <- explore_cpm[keep_genes, , drop = FALSE]
+
+# Apply the log transformation.
+log_expression <- log2(filtered_cpm + 1)
+
+# Check the number of retained genes and samples.
+dim(log_expression)
+
+# Preview a small section of the transformed values.
+log_expression[1:5, 1:4]
+
+#Identify candidate genes
+#For each retained gene, I will calculate the median log2(CPM + 1) 
+#separately in primary tumor and normal tissue samples. 
+#I will subtract the normal median from the tumor median 
+#to describe the direction and size of the difference.
+
+#Positive differences indicate higher median expression 
+#in tumor samples, while negative differences indicate higher 
+#median expression in normal samples. I will rank genes 
+#by the absolute size of this difference and select 
+#20 candidates for visual exploration.
+
+# Identify which sample columns belong to each tissue group.
+tumor_samples <- explore_metadata$sample_type == "Primary Tumor"
+normal_samples <- explore_metadata$sample_type == "Solid Tissue Normal"
+
+# Calculate each gene's median log expression in tumor samples.
+tumor_median <- apply(
+  log_expression[, tumor_samples, drop = FALSE],
+  MARGIN = 1,
+  FUN = median
+)
+
+# Calculate each gene's median log expression in normal samples.
+normal_median <- apply(
+  log_expression[, normal_samples, drop = FALSE],
+  MARGIN = 1,
+  FUN = median
+)
+
+# Combine the results, calculate differences, and rank the genes.
+gene_comparison <- tibble(
+  Gene_ID = rownames(log_expression),
+  Tumor_median = tumor_median,
+  Normal_median = normal_median
+) %>%
+  mutate(
+    Median_difference = Tumor_median - Normal_median
+  ) %>%
+  arrange(desc(abs(Median_difference)))
+
+# Save the 20 genes with the largest absolute differences.
+top20_candidates <- head(gene_comparison, 20)
+
+# Display the shortlist as a readable table.
+knitr::kable(top20_candidates, digits = 2)
+
+```
+
+## Heatmap of Candidate Genes
+
+I will visualize the 20 candidate genes using a heatmap. Each row represents a gene, and each column represents a sample. An annotation bar will identify normal and primary tumor samples.
+
+I will standardize the log-transformed expression values within each gene to create row z-scores. Red will indicate expression above that gene’s average, blue will indicate expression below its average, and white will indicate expression near its average.
+
+Because I shortlisted these genes using their tumor–normal differences, a group contrast is expected. The heatmap will help me examine how consistently those patterns appear across individual samples.
+
+```{r exploratory-heatmap, fig.width=11, fig.height=7}
+
+# Extract expression values for the 20 shortlisted genes.
+candidate_expression <- log_expression[
+  top20_candidates$Gene_ID,
+  ,
+  drop = FALSE
+]
+
+# Standardize each gene across samples.
+# scale() works on columns, so transpose before and after scaling.
+scaled_expression <- t(scale(t(candidate_expression)))
+
+# Define the tissue groups, with normal samples displayed first.
+sample_group <- factor(
+  explore_metadata$sample_type,
+  levels = c("Solid Tissue Normal", "Primary Tumor")
+)
+
+# Assign colors to the tissue annotation.
+tissue_colors <- c(
+  "Solid Tissue Normal" = "#1B9E77",
+  "Primary Tumor" = "#7570B3"
+)
+
+# Create the annotation bar.
+tissue_annotation <- HeatmapAnnotation(
+  Tissue = sample_group,
+  col = list(Tissue = tissue_colors)
+)
+
+# Create the heatmap.
+candidate_heatmap <- Heatmap(
+  scaled_expression,
+  name = "Row z-score",
+  col = circlize::colorRamp2(
+    c(-2, 0, 2),
+    c("#2166AC", "white", "#B2182B")
+  ),
+  top_annotation = tissue_annotation,
+  column_split = sample_group,
+  cluster_column_slices = FALSE,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_column_names = FALSE,
+  show_column_dend = FALSE,
+  row_names_gp = grid::gpar(fontsize = 8),
+  column_title = "Candidate gene expression by tissue type",
+  use_raster = FALSE,
+  raster_by_magick = FALSE
+)
+
+# Display the heatmap and legends.
+draw(
+  candidate_heatmap,
+  heatmap_legend_side = "right",
+  annotation_legend_side = "right"
+)
+
+```
+
+## Selection of MMP11 for further analysis
+
+Based on my exploratory analysis, I selected MMP11 as my main gene. Its Ensembl gene ID is ENSG00000099953, and its full identifier in this dataset is ENSG00000099953.10.
+
+In the heatmap, MMP11 showed generally higher expression in primary tumor samples than in normal tissue samples, although expression varied among tumors.
+
+MMP11, also called stromelysin-3, encodes matrix metallopeptidase 11. It was originally identified in the supporting tissue surrounding breast carcinomas, connecting my analysis to the tumor microenvironment.(https://pubmed.ncbi.nlm.nih.gov/18979628/)
+
+I will use MMP11 for the required summary statistics, histogram, and violin plot. Because I selected this gene after examining the dataset, I will describe the resulting patterns as an exploratory findings.
+
+## Summary statistics for MMP11 and SCARA5
+
+I will calculate the mean, median, standard deviation, minimum,
+and maximum raw RNA-seq counts for MMP11 and SCARA5 across all
+1,231 samples, including normal tissue, primary tumors, and
+metastatic samples.
+
+```{r mmp11-summary}
+# Identify both genes using their full dataset identifiers.
+mmp11_id <- "ENSG00000099953.10"
+scara5_id <- "ENSG00000168079.17"
+
+# Extract each gene's raw counts across all samples.
+mmp11_counts <- unlist(
+  counts[mmp11_id, ],
+  use.names = FALSE
+)
+
+scara5_counts <- unlist(
+  counts[scara5_id, ],
+  use.names = FALSE
+)
+
+# Calculate the summary statistics separately for each gene.
+gene_summary <- tibble(
+  Gene = c("MMP11", "SCARA5"),
+  Samples = c(
+    length(mmp11_counts),
+    length(scara5_counts)
+  ),
+  Mean = c(
+    mean(mmp11_counts),
+    mean(scara5_counts)
+  ),
+  Median = c(
+    median(mmp11_counts),
+    median(scara5_counts)
+  ),
+  SD = c(
+    sd(mmp11_counts),
+    sd(scara5_counts)
+  ),
+  Minimum = c(
+    min(mmp11_counts),
+    min(scara5_counts)
+  ),
+  Maximum = c(
+    max(mmp11_counts),
+    max(scara5_counts)
+  )
+)
+
+# Display the results as a formatted table.
+knitr::kable(
+  gene_summary,
+  digits = 2,
+  caption = "Summary statistics for MMP11 and SCARA5 raw RNA-seq counts"
+)
+
+```
+
+The mean exceeded the median for both genes. For MMP11, the mean was 24,676.13 compared with a median of 14,465. For SCARA5, the difference was particularly pronounced: the mean was 792.20 compared with a median of 70. These patterns are consistent with right-skewed distributions, where high counts pull the mean upward.
+
+The large standard deviations and wide count ranges indicate substantial variation among samples. SCARA5 also included samples with zero counts. These statistics combine all tissue types; the following plots examine how the counts differ between tissue groups which provides more useful intepretation of the data.
+
+## Histogram of MMP11 counts
+
+```{r mmp11-histogram-raw, fig.width=8, fig.height=5}
+# Create a data frame for plotting.
+mmp11_data <- tibble(
+  Sample_ID = colnames(counts),
+  MMP11_count = mmp11_counts
+)
+
+# Create a histogram using 30 count intervals.
+mmp11_histogram <- ggplot(
+  mmp11_data,
+  aes(x = MMP11_count)
+) +
+  geom_histogram(
+    bins = 30,
+    fill = "#7570B3",
+    colour = "white"
+  ) +
+  scale_x_continuous(
+  breaks = c(0, 100000, 200000),
+  labels = scales::label_comma()
+) +
+  labs(
+    title = "Distribution of MMP11 RNA-seq counts",
+    x = "MMP11 raw RNA-seq count",
+    y = "Number of samples"
+  ) +
+  theme_classic(base_size = 12)
+
+# Display the histogram.
+mmp11_histogram
+```
+
+The distribution of MMP11 raw counts is strongly right-skewed. Most samples have relatively low counts, while a smaller number have high counts, producing a long right tail. These high values can pull the mean above the median. Because this histogram combines all sample types, it does not show which tissue groups contribute to the differences.
+
+### Distribution of MMP11 counts by tissue type
+
+The original histogram showed that MMP11 raw counts were strongly
+right-skewed. I will display log10(count + 1) to make the distribution
+easier to examine.
+
+Separate panels will show normal tissue, primary tumor, and metastatic
+samples. The panels will share the same x-axis scale but use different
+y-axis scales because the groups contain different numbers of samples.
+Each panel will display its sample size.
+
+```{r mmp11-histogram, fig.width=8, fig.height=7}
+# Create the sample-level data used here and in the scatter plot.
+mmp11_data <- tibble(
+  Sample_ID = colnames(counts),
+  MMP11_count = mmp11_counts
+)
+
+# Match each sample to its tissue type.
+histogram_data <- mmp11_data %>%
+  left_join(
+    metadata %>% select(barcode, sample_type),
+    by = c("Sample_ID" = "barcode")
+  ) %>%
+  mutate(
+    sample_type = factor(
+      sample_type,
+      levels = c(
+        "Solid Tissue Normal",
+        "Primary Tumor",
+        "Metastatic"
+      )
+    )
+  )
+
+# Calculate sample sizes for the panel labels.
+histogram_sizes <- table(histogram_data$sample_type)
+
+histogram_labels <- setNames(
+  paste0(
+    names(histogram_sizes),
+    " (n = ", as.integer(histogram_sizes), ")"
+  ),
+  names(histogram_sizes)
+)
+
+# Create histograms with the same bin boundaries in every panel.
+mmp11_histogram <- ggplot(
+  histogram_data,
+  aes(
+    x = log10(MMP11_count + 1),
+    fill = sample_type
+  )
+) +
+  geom_histogram(
+    binwidth = 0.2,
+    boundary = 0,
+    colour = "white",
+    alpha = 0.85
+  ) +
+  facet_wrap(
+    ~ sample_type,
+    ncol = 1,
+    scales = "free_y",
+    labeller = labeller(sample_type = histogram_labels)
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Solid Tissue Normal" = "#1B9E77",
+      "Primary Tumor" = "#7570B3",
+      "Metastatic" = "#D95F02"
+    )
+  ) +
+  labs(
+    title = "Distribution of MMP11 counts by tissue type",
+    x = "log10(MMP11 raw count + 1)",
+    y = "Number of samples"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "none",
+    strip.background = element_rect(
+      fill = "grey95",
+      colour = NA
+    ),
+    strip.text = element_text(face = "bold")
+  )
+
+# Display the updated histogram.
+mmp11_histogram
+```
+The distributions of log-transformed MMP11 counts differ between tissue types. Normal tissue samples are concentrated at lower values, while primary tumor samples generally have higher counts, with some overlap between the groups.
+
+The seven metastatic samples fall within the broad range observed in primary tumors. However, this small group provides limited information about the shape of the metastatic count distribution.
+
+The log transformation reduces the visual influence of extreme counts, making the distributions easier to examine. 
+
+## Selection of a second gene for the scatter plot
+
+The assignment requires a second gene to compare with my main gene. I selected SCARA5, whose Ensembl gene ID is ENSG00000168079 and whose full identifier in this dataset is ENSG00000168079.17.
+
+SCARA5 stands for scavenger receptor class A member 5. Research has reported reduced SCARA5 expression in breast tumors compared with matched noncancerous tissue, consistent with the exploratory findings. https://doi.org/10.1016/j.gene.2018.06.036 
+
+In my exploratory heatmap, SCARA5 generally showed higher expression in normal tissue, while MMP11 generally showed higher expression in tumors. I will compare their raw counts in a scatter plot to examine whether these contrasting group patterns correspond to a relationship across individual samples.
+
+## Scatter plot of MMP11 and SCARA5
+I will compare the raw RNA-seq counts of MMP11 and SCARA5.
+Each point represents one sample, with MMP11 counts on the
+x-axis and SCARA5 counts on the y-axis.
+
+```{r gene-scatter, fig.width=8, fig.height=5}
+# Identify SCARA5 using its full dataset identifier.
+scara5_id <- "ENSG00000168079.17"
+
+# Add SCARA5 counts in the same sample order as MMP11.
+mmp11_data <- mmp11_data %>%
+  mutate(
+    SCARA5_count = unlist(
+      counts[scara5_id, ],
+      use.names = FALSE
+    )
+  )
+
+#In response to peer feedback, I will highlight the 
+#seven metastatic samples in the scatter plot to 
+#examine where they fall relative to 
+#normal tissue and primary tumors.
+
+#Each point represents one sample. I will plot log10(count + 1)
+#for MMP11 and SCARA5 to make the patterns easier to see.
+#Metastatic samples will appear as larger orange triangles.
+
+# Create the scatter plot with one point per sample.
+scatter_data <- mmp11_data %>%
+  mutate(
+    SCARA5_count = unlist(
+      counts[scara5_id, ],
+      use.names = FALSE
+    )
+  ) %>%
+  left_join(
+    metadata %>% select(barcode, sample_type),
+    by = c("Sample_ID" = "barcode")
+  ) %>%
+  mutate(
+    sample_type = factor(
+      sample_type,
+      levels = c(
+        "Solid Tissue Normal",
+        "Primary Tumor",
+        "Metastatic"
+      )
+    )
+  )
+
+# Confirm the number of samples in each tissue group.
+table(scatter_data$sample_type)
+
+# Compare the two genes using log-transformed raw counts.
+gene_scatter_log <- ggplot(
+  scatter_data,
+  aes(
+    x = log10(MMP11_count + 1),
+    y = log10(SCARA5_count + 1),
+    colour = sample_type,
+    shape = sample_type
+  )
+) +
+  # Draw normal and primary tumor samples first.
+  geom_point(
+    data = filter(scatter_data, sample_type != "Metastatic"),
+    alpha = 0.4,
+    size = 1.5
+  ) +
+  # Draw metastatic samples last so they remain visible.
+  geom_point(
+    data = filter(scatter_data, sample_type == "Metastatic"),
+    alpha = 1,
+    size = 3.5
+  ) +
+  scale_colour_manual(
+    values = c(
+      "Solid Tissue Normal" = "#1B9E77",
+      "Primary Tumor" = "#7570B3",
+      "Metastatic" = "#D95F02"
+    )
+  ) +
+  scale_shape_manual(
+    values = c(
+      "Solid Tissue Normal" = 16,
+      "Primary Tumor" = 16,
+      "Metastatic" = 17
+    )
+  ) +
+  labs(
+    title = "MMP11 and SCARA5 counts by tissue type",
+    x = "log10(MMP11 raw count + 1)",
+    y = "log10(SCARA5 raw count + 1)",
+    colour = "Tissue type",
+    shape = "Tissue type"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom")
+
+# Display the updated scatter plot.
+gene_scatter_log
+```
+
+The scatter plot with log-transformed axes shows distinct expression patterns by tissue type. Normal tissue samples generally have lower MMP11 counts and higher SCARA5 counts, while primary tumor samples generally show higher MMP11 counts and lower SCARA5 counts. In response to feedback received, I also now display metastatic samples as large orange triangles which are easily distinguishable on the scatter plot. 
+
+The log transformation makes the group separation and variation among individual samples easier to see. Some samples overlap between groups. The contrasting tissue patterns contribute to the overall relationship between the genes; this plot alone does not establish the same relationship within each tissue group.
+
+## Violin plot of MMP11 counts by tissue type
+
+I will create a violin plot to compare MMP11 RNA-seq counts across the categories of my selected metadata covariate, sample_type: normal tissue, primary tumor, and metastatic samples.
+
+Each violin will show the distribution within a tissue group. Wider portions indicate where values are more concentrated. Because the raw counts are strongly right-skewed, I will display log10(count + 1) to make the distributions easier to compare.
+
+I will overlay individual sample points and a box plot showing the median and middle 50% of values. Group sample sizes will appear on the x-axis to provide context when interpreting the distributions.
+
+```{r mmp11-violin, fig.width=8, fig.height=5}
+# Set the order of the tissue groups.
+violin_data <- scatter_data %>%
+  mutate(
+    sample_type = factor(
+      sample_type,
+      levels = c(
+        "Solid Tissue Normal",
+        "Primary Tumor",
+        "Metastatic"
+      )
+    )
+  )
+
+# Count samples and include group sizes in the axis labels.
+group_sizes <- table(violin_data$sample_type)
+
+group_labels <- setNames(
+  paste0(
+    c("Normal tissue", "Primary tumor", "Metastatic"),
+    "\n(n = ", as.integer(group_sizes), ")"
+  ),
+  names(group_sizes)
+)
+
+# Compare MMP11 counts across tissue groups.
+mmp11_violin <- ggplot(
+  violin_data,
+  aes(
+    x = sample_type,
+    y = log10(MMP11_count + 1),
+    fill = sample_type
+  )
+) +
+  # Draw the distributions with equal maximum widths.
+  geom_violin(trim = TRUE, scale = "width", alpha = 0.7) +
+  # Show individual samples with slight horizontal spacing.
+  geom_jitter(
+    width = 0.08,
+    height = 0,
+    alpha = 0.25,
+    size = 0.8
+  ) +
+  # Show the median and middle 50% inside each violin.
+  geom_boxplot(
+    width = 0.12,
+    fill = "white",
+    outlier.shape = NA
+  ) +
+  # Match the colors used in the scatter plot.
+  scale_fill_manual(
+    values = c(
+      "Solid Tissue Normal" = "#1B9E77",
+      "Primary Tumor" = "#7570B3",
+      "Metastatic" = "#D95F02"
+    )
+  ) +
+  scale_x_discrete(labels = group_labels) +
+  labs(
+    title = "MMP11 counts by tissue type",
+    x = "Tissue type",
+    y = "log10(MMP11 raw count + 1)"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "none")
+
+# Display the plot.
+mmp11_violin
+
+```
+
+## Box plots of MMP11 and SCARA5 counts by tissue type
+
+I will compare the distributions of MMP11 and SCARA5 counts
+across normal tissue, primary tumors, and metastatic samples.
+
+The line inside each box shows the median, and the box contains
+the middle 50% of values. 
+
+I will show the seven metastatic samples individually as orange
+triangles. The y-axis uses log10(count + 1) for both genes.
+
+```{r gene-boxplots, fig.width=9, fig.height=5}
+# Arrange the data with one row per sample and gene.
+boxplot_data <- scatter_data %>%
+  select(
+    Sample_ID,
+    sample_type,
+    MMP11 = MMP11_count,
+    SCARA5 = SCARA5_count
+  ) %>%
+  pivot_longer(
+    cols = c(MMP11, SCARA5),
+    names_to = "Gene",
+    values_to = "Count"
+  ) %>%
+  mutate(
+    Gene = factor(Gene, levels = c("MMP11", "SCARA5"))
+  )
+
+# Count samples before combining the two genes.
+# Each sample contributes one value to each gene panel.
+group_sizes <- table(scatter_data$sample_type)
+
+group_labels <- setNames(
+  paste0(
+    c("Normal tissue", "Primary tumor", "Metastatic"),
+    "\n(n = ", as.integer(group_sizes), ")"
+  ),
+  names(group_sizes)
+)
+
+# Create box plots for both genes.
+gene_boxplots <- ggplot(
+  boxplot_data,
+  aes(
+    x = sample_type,
+    y = log10(Count + 1),
+    fill = sample_type
+  )
+) +
+  geom_boxplot(
+    width = 0.55,
+    alpha = 0.7,
+    outlier.size = 1,
+    outlier.alpha = 0.4
+  ) +
+  # Show individual metastatic samples with slight horizontal spacing.
+  geom_point(
+    data = filter(boxplot_data, sample_type == "Metastatic"),
+    position = position_jitter(
+      width = 0.08,
+      height = 0,
+      seed = 123
+    ),
+    shape = 24,
+    size = 2.5,
+    fill = "#D95F02",
+    colour = "black"
+  ) +
+  facet_wrap(~ Gene, nrow = 1) +
+  scale_fill_manual(
+    values = c(
+      "Solid Tissue Normal" = "#1B9E77",
+      "Primary Tumor" = "#7570B3",
+      "Metastatic" = "#D95F02"
+    )
+  ) +
+  scale_x_discrete(labels = group_labels) +
+  labs(
+    title = "MMP11 and SCARA5 count distributions",
+    x = "Tissue type",
+    y = "log10(raw count + 1)",
+    caption = "Orange triangles show individual metastatic samples."
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "none",
+    strip.background = element_rect(
+      fill = "grey95",
+      colour = NA
+    ),
+    strip.text = element_text(face = "bold")
+  )
+
+# Display the box plots.
+gene_boxplots
+```
+
+Primary tumor samples have a higher median MMP11 count than normal tissue samples. SCARA5 shows the opposite pattern, with a lower median count in primary tumors than in normal tissue. These findings are consistent with the patterns observed in the scatter plot.
+
+Among the seven metastatic samples, the median MMP11 count falls between the normal and primary tumor medians. The median SCARA5 count is lower than in either of the other groups, although the individual metastatic samples vary considerably. These observations are descriptive, and the small metastatic sample size limits generalization.
+
+## Heatmap of 10 selected genes
+
+I will create a heatmap containing MMP11, SCARA5, and eight
+additional genes from my exploratory shortlist. The annotation
+bar will identify each sample's tissue type.
+
+I will enhance the heatmap of ten selected genes by adding two annotation bars: 
+tissue type and PAM50 molecular subtype. This will help me examine expression 
+patterns across tissue groups and explore variation among primary tumor samples.
+
+Counts will be converted to CPM, transformed using log2(CPM + 1), and standardized 
+within each gene. Red will indicate values above that gene’s average, and blue 
+will indicate values below it. Gray in the PAM50 annotation will indicate 
+unavailable subtype information. The PAM50 category “Normal-like” is a 
+molecular classification and does not identify normal tissue samples. 
+
+```{r final-heatmap, fig.width=11, fig.height=7}
+# Select 10 unique genes, including MMP11 and SCARA5.
+heatmap_genes <- unique(
+  c(mmp11_id, scara5_id, top20_candidates$Gene_ID)
+)[1:10]
+
+# Extract their raw counts across all samples.
+heatmap_counts <- as.matrix(
+  counts[heatmap_genes, , drop = FALSE]
+)
+
+# Calculate sample totals using all genes in the original dataset.
+all_library_sizes <- colSums(counts)
+
+# Calculate CPM for the 10 selected genes.
+heatmap_cpm <- sweep(
+  heatmap_counts,
+  MARGIN = 2,
+  STATS = all_library_sizes,
+  FUN = "/"
+) * 1000000
+
+# Transform the values and standardize each gene.
+heatmap_log <- log2(heatmap_cpm + 1)
+heatmap_scaled <- t(scale(t(heatmap_log)))
+
+# Match metadata rows to the heatmap's sample columns.
+heatmap_metadata <- metadata[
+  match(colnames(heatmap_counts), metadata$barcode),
+]
+
+# Set the order of tissue groups.
+heatmap_groups <- factor(
+  heatmap_metadata$sample_type,
+  levels = c(
+    "Solid Tissue Normal",
+    "Primary Tumor",
+    "Metastatic"
+  )
+)
+
+# Extract PAM50 subtype labels in the same sample order.
+pam50 <- as.character(
+  heatmap_metadata$paper_BRCA_Subtype_PAM50
+)
+
+# Convert the dataset codes to readable labels.
+pam50_groups <- case_when(
+  pam50 == "LumA" ~ "Luminal A",
+  pam50 == "LumB" ~ "Luminal B",
+  pam50 == "Her2" ~ "HER2-enriched",
+  pam50 == "Basal" ~ "Basal-like",
+  pam50 == "Normal" ~ "Normal-like",
+  TRUE ~ "Not available"
+)
+
+# Set the order of PAM50 categories in the legend.
+pam50_groups <- factor(
+  pam50_groups,
+  levels = c(
+    "Luminal A",
+    "Luminal B",
+    "HER2-enriched",
+    "Basal-like",
+    "Normal-like",
+    "Not available"
+  )
+)
+
+# Create annotation bars for tissue type and molecular subtype.
+final_annotation <- HeatmapAnnotation(
+  Tissue = heatmap_groups,
+  PAM50 = pam50_groups,
+  col = list(
+    Tissue = c(
+      "Solid Tissue Normal" = "#1B9E77",
+      "Primary Tumor" = "#7570B3",
+      "Metastatic" = "#D95F02"
+    ),
+    PAM50 = c(
+      "Luminal A" = "#56B4E9",
+      "Luminal B" = "#0072B2",
+      "HER2-enriched" = "#CC79A7",
+      "Basal-like" = "#D55E00",
+      "Normal-like" = "#009E73",
+      "Not available" = "#D9D9D9"
+    )
+  )
+)
+
+# Display familiar names for the two main genes.
+gene_labels <- heatmap_genes
+gene_labels[heatmap_genes == mmp11_id] <- "MMP11"
+gene_labels[heatmap_genes == scara5_id] <- "SCARA5"
+
+# Create the heatmap, grouping samples by tissue type.
+final_heatmap <- Heatmap(
+  heatmap_scaled,
+  name = "Row z-score",
+  col = circlize::colorRamp2(
+    c(-2, 0, 2),
+    c("#2166AC", "white", "#B2182B")
+  ),
+  top_annotation = final_annotation,
+  column_split = heatmap_groups,
+  cluster_column_slices = FALSE,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_column_names = FALSE,
+  show_column_dend = FALSE,
+  row_labels = gene_labels,
+  row_names_gp = grid::gpar(fontsize = 9),
+  column_title = "Selected gene expression by tissue type",
+  use_raster = FALSE
+)
+
+# Display the heatmap and annotation legends.
+draw(
+  final_heatmap,
+  heatmap_legend_side = "right",
+  annotation_legend_side = "right"
+)
+```
+
+The heatmap shows contrasting expression patterns between normal tissue and primary tumors. MMP11 generally has lower standardized expression in normal samples and higher expression in primary tumors. SCARA5 shows the opposite pattern. Expression also varies among individual primary tumor samples.
+
+The PAM50 annotation adds molecular subtype information within the primary tumor group. Subtypes are interspersed across the tumor columns, so this figure alone does not demonstrate clear separation of all PAM50 categories. Gray indicates unavailable subtype information.
+
+The seven metastatic samples occupy a narrow section at the right of the heatmap. Their small number limits conclusions about a consistent metastatic expression pattern.
+
+Because the genes were selected using observed tumor–normal differences in this dataset, these contrasts are expected and should be interpreted as exploratory findings.
+
+## Empirical cumulative distributions of gene counts
+
+As an additional plot type, I will use empirical cumulative
+distribution functions to compare MMP11 and SCARA5 counts
+across tissue groups.
+
+At each x-axis value, the curve shows the percentage of samples
+within that tissue group with counts at or below that value.
+The x-axis uses log10(count + 1). A horizontal reference line
+at 50% helps identify the median for each group.
+
+```{r gene-ecdf, fig.width=9, fig.height=5}
+# Reuse the data prepared for the box plots.
+# Each row contains one sample's count for one gene.
+gene_ecdf <- ggplot(
+  boxplot_data,
+  aes(
+    x = log10(Count + 1),
+    colour = sample_type,
+    linetype = sample_type
+  )
+) +
+  # Add a reference line at the 50th percentile.
+  geom_hline(
+    yintercept = 0.5,
+    colour = "grey60",
+    linetype = "dashed"
+  ) +
+  # Calculate the cumulative percentage within each tissue group.
+  stat_ecdf(
+    geom = "step",
+    linewidth = 0.9
+  ) +
+  facet_wrap(~ Gene, nrow = 1) +
+  scale_colour_manual(
+    values = c(
+      "Solid Tissue Normal" = "#1B9E77",
+      "Primary Tumor" = "#7570B3",
+      "Metastatic" = "#D95F02"
+    )
+  ) +
+  scale_linetype_manual(
+    values = c(
+      "Solid Tissue Normal" = "solid",
+      "Primary Tumor" = "longdash",
+      "Metastatic" = "dotdash"
+    )
+  ) +
+  scale_y_continuous(
+    breaks = seq(0, 1, by = 0.25),
+    labels = scales::label_percent(accuracy = 1),
+    limits = c(0, 1)
+  ) +
+  labs(
+    title = "Cumulative distributions of MMP11 and SCARA5 counts",
+    x = "log10(raw count + 1)",
+    y = "Cumulative percentage of samples",
+    colour = "Tissue type",
+    linetype = "Tissue type"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    strip.background = element_rect(
+      fill = "grey95",
+      colour = NA
+    ),
+    strip.text = element_text(face = "bold")
+  )
+
+# Display the ECDF plot.
+gene_ecdf
+```
+
+For MMP11, the normal tissue curve is shifted toward lower counts compared with the primary tumor curve. The metastatic median falls between the normal and primary tumor medians, consistent with the box plots.
+
+SCARA5 shows the opposite tissue pattern: normal samples generally have higher counts than primary tumor samples. The metastatic curve overlaps and crosses the primary tumor curve, indicating that the difference between these groups is not a uniform shift across the entire distribution. The ECDF compares percentages within each tissue group, allowing groups of different sizes to be displayed together. 
+
+# Conclusion
+
+This exploratory analysis showed contrasting patterns for MMP11 and SCARA5 in breast cancer samples. Primary tumors generally had higher MMP11 counts and lower SCARA5 counts than normal tissue. The scatter plot, box plots, and ECDF provided consistent views of these differences, while the histograms illustrated variation in MMP11 counts within each tissue group.
+
+In response to peer feedback, I highlighted the seven metastatic samples in the scatter plot. These samples showed variable counts and overlapped the primary tumor distribution. Their small number limits conclusions about a typical metastatic pattern.
+
+The ten-gene heatmap illustrated contrasting standardized expression patterns between normal and tumor tissue. Adding the PAM50 annotation provided further context for variation among primary tumors.
+
+Because I selected the genes after exploring this dataset, these findings should be interpreted as descriptive and exploratory. They do not establish statistical significance or causation, but support further investigation of MMP11 and SCARA5 in breast cancer.
+
+## Software and package versions
+
+The following table records the R and package versions used
+to prepare the data, calculate summary statistics, generate
+the plots, and knit this document.
+
+```{r software-versions}
+# List the packages used in this analysis.
+packages_used <- c(
+  "tidyverse",
+  "ggplot2",
+  "dplyr",
+  "tidyr",
+  "tibble",
+  "ComplexHeatmap",
+  "circlize",
+  "scales",
+  "knitr",
+  "rmarkdown"
+)
+
+# Retrieve the installed version of each package.
+package_versions <- vapply(
+  packages_used,
+  function(package_name) {
+    as.character(packageVersion(package_name))
+  },
+  character(1)
+)
+
+# Combine the R version and package versions into one table.
+software_versions <- tibble(
+  Software = c("R", packages_used),
+  Version = c(
+    as.character(getRversion()),
+    unname(package_versions)
+  )
+)
+
+# Display the software versions.
+knitr::kable(
+  software_versions,
+  caption = "R and package versions used in the analysis"
+)
+```
+
+## Export figures and tables
+
+```{r export-results}
+# Create folders inside the final-project directory.
+dir.create("figures", showWarnings = FALSE)
+dir.create("tables", showWarnings = FALSE)
+
+# Save the histogram.
+ggsave(
+  filename = "figures/mmp11_histogram.pdf",
+  plot = mmp11_histogram,
+  width = 8,
+  height = 7
+)
+
+# Save the updated scatter plot.
+ggsave(
+  filename = "figures/gene_scatter.pdf",
+  plot = gene_scatter_log,
+  width = 8,
+  height = 5
+)
+
+# Save the box plots.
+ggsave(
+  filename = "figures/gene_boxplots.pdf",
+  plot = gene_boxplots,
+  width = 9,
+  height = 5
+)
+
+# Save the additional ECDF plot.
+ggsave(
+  filename = "figures/gene_ecdf.pdf",
+  plot = gene_ecdf,
+  width = 9,
+  height = 5
+)
+
+# Save the ComplexHeatmap using a PDF graphics device.
+pdf(
+  file = "figures/gene_heatmap.pdf",
+  width = 11,
+  height = 7,
+  useDingbats = FALSE
+)
+
+draw(
+  final_heatmap,
+  heatmap_legend_side = "right",
+  annotation_legend_side = "right"
+)
+
+# Close the graphics device to finish writing the PDF.
+invisible(dev.off())
+
+# Save the gene summary statistics as a CSV.
+write.csv(
+  gene_summary,
+  file = "tables/gene_summary.csv",
+  row.names = FALSE
+)
+
+# Save the software versions as a CSV.
+write.csv(
+  software_versions,
+  file = "tables/software_versions.csv",
+  row.names = FALSE
+)
+
+# Generate a formatted summary table for the LaTeX report.
+writeLines(
+  knitr::kable(
+    gene_summary,
+    format = "latex",
+    booktabs = TRUE,
+    digits = 2,
+    caption = "Summary statistics for raw RNA-seq counts across all samples.",
+    label = "gene-summary"
+  ),
+  con = "tables/gene_summary.tex"
+)
+
+# List the exported files.
+list.files("figures")
+list.files("tables")
+```

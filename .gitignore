@@ -1,0 +1,28 @@
+# Course-provided raw data
+data/*.csv
+counts.csv
+meta_data.csv
+
+# R session files
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+
+# macOS files
+.DS_Store
+
+# LaTeX temporary files
+*.aux
+*.log
+*.out
+*.blg
+*.bbl
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+
+# Intermediate R Markdown files
+analysis.tex
+analysis.knit.md
+analysis.utf8.md
